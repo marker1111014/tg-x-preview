@@ -121,8 +121,8 @@ export const app = new Hono<{
     /* Telegram Webhook route sits at root regardless of domain */
     if (url.pathname === '/tg-webhook') {
       realm = '';
-    } else if (Constants.API_HOST_LIST.includes(url.hostname) || url.pathname.startsWith('/2/')) {
-      /* Override if in API_HOST_LIST or v2 API path (/2/...). Note that we have to check full hostname for API_HOST_LIST. */
+    } else if (Constants.API_HOST_LIST.includes(url.hostname)) {
+      /* Override if in API_HOST_LIST. Note that we have to check full hostname for this. */
       realm = 'api';
       console.log('API realm');
     } else if (Constants.BLUESKY_API_HOST_LIST.includes(url.hostname)) {
@@ -131,6 +131,10 @@ export const app = new Hono<{
     } else if (Constants.ATMOSPHERE_API_HOST_LIST.includes(url.hostname)) {
       realm = 'atmosphere';
       console.log('Atmosphere API realm');
+    } else if (url.pathname.startsWith('/2/')) {
+      /* Allow v2 JSON API on the same host (e.g. *.workers.dev/2/status/:id) */
+      realm = 'api';
+      console.log('API realm');
     } else if (Constants.STANDARD_DOMAIN_LIST.includes(baseHostName)) {
       realm = 'twitter';
       console.log('Twitter realm');

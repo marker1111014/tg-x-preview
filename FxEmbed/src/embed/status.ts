@@ -340,22 +340,9 @@ export const handleStatus = async (
 
   /* Catch direct media request (d.fxtwitter.com, or .mp4 / .jpg) */
   if (flags?.direct && !flags?.textOnly && status.media) {
-    let redirectUrl: string | null = null;
     const all = status.media.all || [];
-    // if (status.media.videos) {
-    //   const { videos } = status.media;
-    //   redirectUrl = (videos[(mediaNumber || 1) - 1] || videos[0]).url;
-    // } else if (status.media.photos) {
-    //   const { photos } = status.media;
-    //   redirectUrl = (photos[(mediaNumber || 1) - 1] || photos[0]).url;
-    // }
-
-    const selectedMedia = all[(mediaNumber || 1) - 1];
-    if (selectedMedia) {
-      redirectUrl = selectedMedia.url ?? null;
-    } else if (all.length > 0) {
-      redirectUrl = all[0].url ?? null;
-    }
+    const selectedMedia = all[(mediaNumber || 1) - 1] ?? all[0];
+    let redirectUrl: string | null = selectedMedia?.url ?? null;
 
     if (redirectUrl) {
       if (selectedMedia?.type === 'gif' && shouldTranscodeGif(c)) {
@@ -560,58 +547,57 @@ export const handleStatus = async (
           ? status.quote?.media || {}
           : {};
     if (overrideMedia) {
-      let instructions: ResponseInstructions;
+      let instructions: ResponseInstructions | undefined;
+      const isVideoOverride =
+        overrideMedia.type === 'video' ||
+        (overrideMedia.type === 'gif' && 'duration' in overrideMedia);
 
-      switch (overrideMedia.type) {
-        case 'photo':
-          /* This status has a photo to render. */
-          instructions = renderPhoto(
-            {
-              context: c,
-              status: status as APIStatus,
-              authorText: authorText,
-              engagementText: engagementText,
-              userAgent: userAgent,
-              isOverrideMedia: true
-            },
-            overrideMedia as APIPhoto
-          );
-          headers.push(...instructions.addHeaders);
-          if (instructions.authorText) {
-            authorText = instructions.authorText;
-          }
-          if (instructions.siteName) {
-            siteName = instructions.siteName;
-          }
-          /* Overwrite our Twitter Card if overriding media, so it displays correctly in Discord */
-          if (status.embed_card === 'player') {
-            status.embed_card = 'summary_large_image';
-          }
-          break;
-        case 'video':
-          instructions = renderVideo(
-            {
-              context: c,
-              status: status as APIStatus,
-              userAgent: userAgent,
-              text: newText,
-              isOverrideMedia: true
-            },
-            overrideMedia as APIVideo
-          );
-          headers.push(...instructions.addHeaders);
-          if (instructions.authorText) {
-            authorText = instructions.authorText;
-          }
-          if (instructions.siteName) {
-            siteName = instructions.siteName;
-          }
-          /* Overwrite our Twitter Card if overriding media, so it displays correctly in Discord */
-          if (status.embed_card !== 'player') {
-            status.embed_card = 'player';
-          }
-          /* This status has a video to render. */
-          break;
+      if (isVideoOverride) {
+        instructions = renderVideo(
+          {
+            context: c,
+            status: status as APIStatus,
+            userAgent: userAgent,
+            text: newText,
+            isOverrideMedia: true
+          },
+          overrideMedia as APIVideo
+        );
+        /* Overwrite our Twitter Card if overriding media, so it displays correctly in Discord */
+        if (status.embed_card !== 'player') {
+          status.embed_card = 'player';
+        }
+      } else if (overrideMedia.type === 'photo' || overrideMedia.type === 'gif') {
+        const photoMedia = overrideMedia as APIPhoto;
+        const photoForRender =
+          overrideMedia.type === 'gif' && shouldTranscodeGif(c) && photoMedia.transcode_url
+            ? { ...photoMedia, url: photoMedia.transcode_url }
+            : photoMedia;
+        instructions = renderPhoto(
+          {
+            context: c,
+            status: status as APIStatus,
+            authorText: authorText,
+            engagementText: engagementText,
+            userAgent: userAgent,
+            isOverrideMedia: true
+          },
+          photoForRender
+        );
+        /* Overwrite our Twitter Card if overriding media, so it displays correctly in Discord */
+        if (status.embed_card === 'player') {
+          status.embed_card = 'summary_large_image';
+        }
+      }
+
+      if (instructions) {
+        headers.push(...instructions.addHeaders);
+        if (instructions.authorText) {
+          authorText = instructions.authorText;
+        }
+        if (instructions.siteName) {
+          siteName = instructions.siteName;
+        }
       }
     } else if (media?.videos) {
       const instructions = renderVideo(

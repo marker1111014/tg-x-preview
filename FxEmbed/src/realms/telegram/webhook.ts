@@ -48,6 +48,8 @@ type StatusRef = {
 
 type MediaItem = APIPhoto | APIVideo;
 
+type BinaryMediaKind = 'mp4' | 'gif' | 'jpeg' | 'png' | 'webp' | 'other_image' | 'unknown';
+
 type TelegramApiResponse = {
   ok: boolean;
   description?: string;
@@ -201,7 +203,75 @@ function getMediaDuration(item: MediaItem): number {
   return 'duration' in item ? Number(item.duration || 0) : 0;
 }
 
-function pickVideoCandidates(item: MediaItem): string[] {
+export function isStaticImageUrl(url: string): boolean {
+  if (!url) return false;
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const path = parsed.pathname.toLowerCase();
+    if (host === 'pbs.twimg.com' && path.includes('/tweet_video_thumb/')) {
+      return true;
+    }
+    return /\.(jpe?g|png|webp|avif|bmp)$/i.test(path);
+  } catch {
+    return /\.(jpe?g|png|webp|avif|bmp)(?:[?#]|$)/i.test(url);
+  }
+}
+
+export function detectBinaryMediaKind(data: ArrayBuffer, contentType?: string): BinaryMediaKind {
+  const bytes = new Uint8Array(data);
+  if (bytes.length >= 6) {
+    const head6 = String.fromCharCode(
+      bytes[0]!,
+      bytes[1]!,
+      bytes[2]!,
+      bytes[3]!,
+      bytes[4]!,
+      bytes[5]!
+    );
+    if (head6 === 'GIF87a' || head6 === 'GIF89a') {
+      return 'gif';
+    }
+  }
+  if (bytes.length >= 12) {
+    const boxType = String.fromCharCode(bytes[4]!, bytes[5]!, bytes[6]!, bytes[7]!);
+    if (boxType === 'ftyp') {
+      return 'mp4';
+    }
+    const riff = String.fromCharCode(bytes[0]!, bytes[1]!, bytes[2]!, bytes[3]!);
+    const webp = String.fromCharCode(bytes[8]!, bytes[9]!, bytes[10]!, bytes[11]!);
+    if (riff === 'RIFF' && webp === 'WEBP') {
+      return 'webp';
+    }
+  }
+  if (bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff) {
+    return 'jpeg';
+  }
+  if (
+    bytes.length >= 4 &&
+    bytes[0] === 0x89 &&
+    bytes[1] === 0x50 &&
+    bytes[2] === 0x4e &&
+    bytes[3] === 0x47
+  ) {
+    return 'png';
+  }
+
+  const ct = (contentType ?? '').split(';')[0]?.trim().toLowerCase() ?? '';
+  if (ct === 'image/gif') return 'gif';
+  if (ct === 'video/mp4' || ct === 'video/webm') return 'mp4';
+  if (ct === 'image/jpeg' || ct === 'image/jpg') return 'jpeg';
+  if (ct === 'image/png') return 'png';
+  if (ct === 'image/webp') return 'webp';
+  if (ct.startsWith('image/')) return 'other_image';
+  return 'unknown';
+}
+
+function isStaticBinaryKind(kind: BinaryMediaKind): boolean {
+  return kind === 'jpeg' || kind === 'png' || kind === 'webp' || kind === 'other_image';
+}
+
+export function pickVideoCandidates(item: MediaItem): string[] {
   const formats = 'formats' in item && Array.isArray(item.formats) ? item.formats : [];
   const mp4s = formats.filter(f => f.container === 'mp4' && Boolean(f.url));
   const duration = getMediaDuration(item);
@@ -218,9 +288,24 @@ function pickVideoCandidates(item: MediaItem): string[] {
     .filter(f => estimateVideoBytes(f, duration) > MAX_TG_VIDEO_URL_BYTES)
     .sort((a, b) => (a.bitrate ?? 0) - (b.bitrate ?? 0));
 
-  const urls = [...fitting, ...oversized].map(f => f.url);
-  if (item.url && !urls.includes(item.url)) {
+  const urls: string[] = [];
+  for (const f of [...fitting, ...oversized]) {
+    if (!isStaticImageUrl(f.url) && !urls.includes(f.url)) {
+      urls.push(f.url);
+    }
+  }
+  if (item.url && !isStaticImageUrl(item.url) && !urls.includes(item.url)) {
     urls.push(item.url);
+  }
+  if (
+    item.type === 'gif' &&
+    'transcode_url' in item &&
+    typeof item.transcode_url === 'string' &&
+    item.transcode_url &&
+    !isStaticImageUrl(item.transcode_url) &&
+    !urls.includes(item.transcode_url)
+  ) {
+    urls.push(item.transcode_url);
   }
   return urls;
 }
@@ -324,7 +409,11 @@ async function sendSingleVideo(
 ): Promise<boolean> {
   const method = item.type === 'gif' ? 'sendAnimation' : 'sendVideo';
   const field = item.type === 'gif' ? 'animation' : 'video';
-  const candidates = item.type === 'gif' ? [item.url] : pickVideoCandidates(item);
+  const candidates = pickVideoCandidates(item);
+  if (candidates.length === 0) {
+    console.warn(`${method} aborted: no non-static video/animation candidate URL found`);
+    return false;
+  }
   const duration = Math.round(getMediaDuration(item));
 
   for (const cand of candidates.slice(0, 2)) {
@@ -345,24 +434,59 @@ async function sendSingleVideo(
     console.warn(`${method} URL failed (${cand}):`, res.description);
   }
 
-  const lastCand = candidates[candidates.length - 1];
-  if (!lastCand) return false;
-  const bin = await fetchBinaryCapped(lastCand, MAX_WORKER_UPLOAD_BYTES);
-  if (!bin) return false;
+  for (const cand of [...candidates].reverse()) {
+    const bin = await fetchBinaryCapped(cand, MAX_WORKER_UPLOAD_BYTES);
+    if (!bin) continue;
+    const kind = detectBinaryMediaKind(bin.data, bin.contentType);
+    if (isStaticBinaryKind(kind)) {
+      console.warn(`${method} rejected static image binary from ${cand} (${kind})`);
+      continue;
+    }
 
-  const form = new FormData();
-  form.set('chat_id', String(chatId));
-  form.set('caption', caption);
-  form.set('parse_mode', 'HTML');
-  form.set('reply_parameters', JSON.stringify({ message_id: replyToMessageId }));
-  if (item.width) form.set('width', String(item.width));
-  if (item.height) form.set('height', String(item.height));
-  if (duration > 0) form.set('duration', String(duration));
-  if (item.type === 'video') form.set('supports_streaming', 'true');
-  form.set(field, new Blob([bin.data], { type: 'video/mp4' }), 'video.mp4');
+    const isGif = kind === 'gif';
+    const filename = isGif ? 'animation.gif' : 'video.mp4';
+    const mime = isGif ? 'image/gif' : 'video/mp4';
 
-  const uploadRes = await callTelegramMultipart(botToken, method, form);
-  return uploadRes.ok;
+    const form = new FormData();
+    form.set('chat_id', String(chatId));
+    form.set('caption', caption);
+    form.set('parse_mode', 'HTML');
+    form.set('reply_parameters', JSON.stringify({ message_id: replyToMessageId }));
+    if (item.width) form.set('width', String(item.width));
+    if (item.height) form.set('height', String(item.height));
+    if (duration > 0) form.set('duration', String(duration));
+    if (item.type === 'video') form.set('supports_streaming', 'true');
+    form.set(field, new Blob([bin.data], { type: mime }), filename);
+
+    const uploadRes = await callTelegramMultipart(botToken, method, form);
+    if (uploadRes.ok) return true;
+    console.warn(`${method} binary upload failed (${cand}):`, uploadRes.description);
+  }
+  return false;
+}
+
+function buildMediaGroupEntry(
+  item: MediaItem,
+  mediaRef: string,
+  index: number,
+  caption: string | undefined
+): Record<string, unknown> {
+  const entry: Record<string, unknown> = {
+    type: item.type === 'photo' ? 'photo' : 'video',
+    media: mediaRef
+  };
+  if (index === 0 && caption) {
+    entry.caption = caption;
+    entry.parse_mode = 'HTML';
+  }
+  if (item.type !== 'photo') {
+    if (item.width) entry.width = item.width;
+    if (item.height) entry.height = item.height;
+    const dur = Math.round(getMediaDuration(item));
+    if (dur > 0) entry.duration = dur;
+    entry.supports_streaming = true;
+  }
+  return entry;
 }
 
 async function sendMediaGroupChunk(
@@ -372,29 +496,24 @@ async function sendMediaGroupChunk(
   chunk: MediaItem[],
   caption: string | undefined
 ): Promise<boolean> {
-  const mediaEntries = chunk.map((item, idx) => {
-    const mediaUrl =
-      item.type === 'photo'
-        ? getPhotoUrlForTelegram(item.url)
-        : (pickVideoCandidates(item as APIVideo)[0] ?? item.url);
-    const entry: Record<string, unknown> = {
-      type: item.type === 'photo' ? 'photo' : 'video',
-      media: mediaUrl
-    };
-    if (idx === 0 && caption) {
-      entry.caption = caption;
-      entry.parse_mode = 'HTML';
+  const resolvedUrls: string[] = [];
+  const mediaEntries: Record<string, unknown>[] = [];
+  for (let idx = 0; idx < chunk.length; idx++) {
+    const item = chunk[idx]!;
+    let mediaUrl: string | undefined;
+    if (item.type === 'photo') {
+      mediaUrl = getPhotoUrlForTelegram(item.url);
+    } else {
+      const candidates = pickVideoCandidates(item);
+      mediaUrl = candidates.find(u => !/\.gif(?:[?#]|$)/i.test(u)) ?? candidates[0];
     }
-    if (item.type !== 'photo') {
-      const vid = item as APIVideo;
-      if (vid.width) entry.width = vid.width;
-      if (vid.height) entry.height = vid.height;
-      const dur = Math.round(Number(vid.duration || 0));
-      if (dur > 0) entry.duration = dur;
-      entry.supports_streaming = true;
+    if (!mediaUrl) {
+      console.warn('sendMediaGroup aborted: missing valid media URL for item', item.type);
+      return false;
     }
-    return entry;
-  });
+    resolvedUrls.push(mediaUrl);
+    mediaEntries.push(buildMediaGroupEntry(item, mediaUrl, idx, caption));
+  }
 
   const payload: Record<string, unknown> = {
     chat_id: chatId,
@@ -424,33 +543,23 @@ async function sendMediaGroupChunk(
     const mediaUrl =
       item.type === 'photo'
         ? getPhotoUrlForTelegram(item.url)
-        : (pickVideoCandidates(item as APIVideo).slice(-1)[0] ?? item.url);
+        : (pickVideoCandidates(item).slice(-1)[0] ?? resolvedUrls[i]!);
     const bin = await fetchBinaryCapped(mediaUrl, MAX_WORKER_UPLOAD_BYTES);
     if (!bin || totalBytes + bin.data.byteLength > MAX_WORKER_GROUP_TOTAL_BYTES) {
       return false;
     }
+    const kind = detectBinaryMediaKind(bin.data, bin.contentType);
+    if (item.type !== 'photo' && isStaticBinaryKind(kind)) {
+      console.warn(`sendMediaGroup rejected static image binary for ${item.type} (${mediaUrl})`);
+      return false;
+    }
     totalBytes += bin.data.byteLength;
     const attachName = `file_${i}`;
-    const ext = item.type === 'photo' ? 'jpg' : 'mp4';
-    form.set(attachName, new Blob([bin.data], { type: bin.contentType }), `${attachName}.${ext}`);
-
-    const entry: Record<string, unknown> = {
-      type: item.type === 'photo' ? 'photo' : 'video',
-      media: `attach://${attachName}`
-    };
-    if (i === 0 && caption) {
-      entry.caption = caption;
-      entry.parse_mode = 'HTML';
-    }
-    if (item.type !== 'photo') {
-      const vid = item as APIVideo;
-      if (vid.width) entry.width = vid.width;
-      if (vid.height) entry.height = vid.height;
-      const dur = Math.round(Number(vid.duration || 0));
-      if (dur > 0) entry.duration = dur;
-      entry.supports_streaming = true;
-    }
-    uploadEntries.push(entry);
+    const ext = item.type === 'photo' ? 'jpg' : kind === 'gif' ? 'gif' : 'mp4';
+    const mime =
+      item.type === 'photo' ? bin.contentType : kind === 'gif' ? 'image/gif' : 'video/mp4';
+    form.set(attachName, new Blob([bin.data], { type: mime }), `${attachName}.${ext}`);
+    uploadEntries.push(buildMediaGroupEntry(item, `attach://${attachName}`, i, caption));
   }
 
   form.set('media', JSON.stringify(uploadEntries));
@@ -668,7 +777,10 @@ export const telegramWebhook = async (
 
   const reqUrl = new URL(c.req.url);
   const baseUrl = `${reqUrl.protocol}//${reqUrl.host}`;
-  const twitterHost = twitterBuildHostFromContext(c);
+  const twitterHost = {
+    ...twitterBuildHostFromContext(c),
+    shouldTranscodeGif: () => false
+  };
 
   const work = handleTelegramMessage(message, botToken, baseUrl, twitterHost).catch(err => {
     console.error('Unhandled Telegram webhook error:', err);

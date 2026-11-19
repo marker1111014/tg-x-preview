@@ -39,7 +39,10 @@ export const Constants = {
     return h ? `https://${h}` : '';
   })(),
   RELEASE_NAME: process.env.RELEASE_NAME || 'local',
-  GIF_TRANSCODE_DOMAIN_LIST: (process.env.GIF_TRANSCODE_DOMAIN_LIST ?? '').split(','),
+  GIF_TRANSCODE_DOMAIN_LIST: (process.env.GIF_TRANSCODE_DOMAIN_LIST ?? '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean),
   VIDEO_TRANSCODE_DOMAIN_LIST: (process.env.VIDEO_TRANSCODE_DOMAIN_LIST ?? '').split(','),
   VIDEO_TRANSCODE_BSKY_DOMAIN_LIST: (process.env.VIDEO_TRANSCODE_BSKY_DOMAIN_LIST ?? '').split(','),
   PBS_PROXY_DOMAIN_LIST: (process.env.PBS_PROXY_DOMAIN_LIST ?? '').split(','),

@@ -137,7 +137,51 @@ def build_caption(status: dict[str, Any], limit: int = MAX_CAPTION_LEN) -> tuple
     return short_msg, full_msg[:MAX_TEXT_LEN]
 
 
-async def fetch_bytes(client: httpx.AsyncClient, url: str, max_bytes: int) -> bytes | None:
+STATIC_IMAGE_EXT_RE = re.compile(r"\.(?:jpe?g|png|webp|avif|bmp)$", re.IGNORECASE)
+
+
+def is_static_image_url(url: str) -> bool:
+    if not url:
+        return False
+    parsed = urlparse(url)
+    host = parsed.hostname.lower() if parsed.hostname else ""
+    path = parsed.path.lower()
+    if host == "pbs.twimg.com" and "/tweet_video_thumb/" in path:
+        return True
+    return bool(STATIC_IMAGE_EXT_RE.search(path))
+
+
+def detect_media_kind(data: bytes, content_type: str = "") -> str:
+    if len(data) >= 6 and data[:6] in (b"GIF87a", b"GIF89a"):
+        return "gif"
+    if len(data) >= 12 and data[4:8] == b"ftyp":
+        return "mp4"
+    if len(data) >= 3 and data[:3] == b"\xff\xd8\xff":
+        return "jpeg"
+    if len(data) >= 4 and data[:4] == b"\x89PNG":
+        return "png"
+    if len(data) >= 12 and data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+        return "webp"
+
+    ct = content_type.split(";")[0].strip().lower()
+    if ct == "image/gif":
+        return "gif"
+    if ct in ("video/mp4", "video/webm"):
+        return "mp4"
+    if ct in ("image/jpeg", "image/jpg"):
+        return "jpeg"
+    if ct == "image/png":
+        return "png"
+    if ct == "image/webp":
+        return "webp"
+    if ct.startswith("image/"):
+        return "other_image"
+    return "unknown"
+
+
+async def fetch_bytes_with_type(
+    client: httpx.AsyncClient, url: str, max_bytes: int
+) -> tuple[bytes, str] | None:
     try:
         async with client.stream("GET", url, follow_redirects=True) as resp:
             if resp.status_code != 200:
@@ -153,10 +197,16 @@ async def fetch_bytes(client: httpx.AsyncClient, url: str, max_bytes: int) -> by
                 if len(buf) > max_bytes:
                     logger.info("Stream exceeded %s bytes: %s", max_bytes, url)
                     return None
-            return bytes(buf)
+            content_type = resp.headers.get("content-type", "")
+            return bytes(buf), content_type
     except httpx.HTTPError as exc:
         logger.warning("HTTP error fetching %s: %s", url, exc)
         return None
+
+
+async def fetch_bytes(client: httpx.AsyncClient, url: str, max_bytes: int) -> bytes | None:
+    res = await fetch_bytes_with_type(client, url, max_bytes)
+    return res[0] if res is not None else None
 
 
 async def fetch_photo_file(client: httpx.AsyncClient, item: dict[str, Any]) -> io.BytesIO | str:
@@ -196,20 +246,42 @@ def pick_video_candidates(item: dict[str, Any]) -> list[str]:
         key=lambda f: (1 if f.get("codec") == "h264" else 0, int(f.get("bitrate") or 0)),
         reverse=True,
     )
-    urls: list[str] = [f["url"] for f in formats]
-    if item.get("url") and item["url"] not in urls:
-        urls.insert(0, item["url"])
+    urls: list[str] = []
+    for fmt in formats:
+        furl = fmt["url"]
+        if not is_static_image_url(furl) and furl not in urls:
+            urls.append(furl)
+
+    item_url = item.get("url") or ""
+    if item_url and not is_static_image_url(item_url) and item_url not in urls:
+        urls.append(item_url)
+
+    transcode_url = item.get("transcode_url") or ""
+    if (
+        item.get("type") == "gif"
+        and transcode_url
+        and not is_static_image_url(transcode_url)
+        and transcode_url not in urls
+    ):
+        urls.append(transcode_url)
     return urls
 
 
 async def fetch_video_file(client: httpx.AsyncClient, item: dict[str, Any]) -> io.BytesIO | str | None:
-    for cand in pick_video_candidates(item):
-        data = await fetch_bytes(client, cand, MAX_VIDEO_UPLOAD_BYTES)
-        if data:
-            bio = io.BytesIO(data)
-            bio.name = "video.mp4"
-            return bio
-    return item.get("url")
+    candidates = pick_video_candidates(item)
+    for cand in candidates:
+        fetched = await fetch_bytes_with_type(client, cand, MAX_VIDEO_UPLOAD_BYTES)
+        if not fetched:
+            continue
+        data, content_type = fetched
+        kind = detect_media_kind(data, content_type)
+        if kind in ("jpeg", "png", "webp", "other_image"):
+            logger.warning("Rejected static image (%s) for %s from %s", kind, item.get("type"), cand)
+            continue
+        bio = io.BytesIO(data)
+        bio.name = "animation.gif" if kind == "gif" else "video.mp4"
+        return bio
+    return candidates[0] if candidates else None
 
 
 async def fetch_status_json(client: httpx.AsyncClient, status_id: str) -> dict[str, Any] | None:
@@ -283,6 +355,9 @@ async def send_status_to_chat(
             elif mtype == "gif":
                 await msg.chat.send_action(ChatAction.UPLOAD_VIDEO)
                 gif_input = await fetch_video_file(client, item)
+                if not gif_input:
+                    await msg.reply_text(fallback_url, reply_to_message_id=msg.message_id)
+                    return
                 await msg.reply_animation(
                     animation=gif_input,
                     caption=caption,
@@ -295,6 +370,9 @@ async def send_status_to_chat(
             else:
                 await msg.chat.send_action(ChatAction.UPLOAD_VIDEO)
                 vid_input = await fetch_video_file(client, item)
+                if not vid_input:
+                    await msg.reply_text(fallback_url, reply_to_message_id=msg.message_id)
+                    return
                 await msg.reply_video(
                     video=vid_input,
                     caption=caption,
